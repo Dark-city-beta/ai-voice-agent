@@ -158,26 +158,28 @@ def send_to_openclaw(text):
         env = os.environ.copy()
         env["OPENCLAW_TOKEN"] = "openclaw123"
         result = subprocess.run(
-            [OPENCLAW_CMD, "agent", "--session-id", "voice_bridge", "--message", text, "--json"],
+            [OPENCLAW_CMD, "agent", "--session-id", "voice_bridge", "--message", text, "--json", "--timeout", "120"],
             capture_output=True,
             text=True,
-            timeout=60,
+            timeout=130,
             env=env
         )
         
         if result.returncode == 0:
             try:
                 data = json.loads(result.stdout)
-                # Извлекаем текст из payloads
-                if "payloads" in data and isinstance(data["payloads"], list) and len(data["payloads"]) > 0:
+                # Извлекаем текст из payloads (OpenClaw оборачивает в result)
+                result_data = data.get("result", data)
+                payloads = result_data.get("payloads", data.get("payloads", []))
+                if isinstance(payloads, list) and len(payloads) > 0:
                     texts = []
-                    for p in data["payloads"]:
+                    for p in payloads:
                         if isinstance(p, dict) and "text" in p and p["text"]:
                             texts.append(p["text"])
                     reply = "\n\n".join(texts)
                 else:
                     reply = data.get("reply", data.get("message", data.get("text", result.stdout)))
-                return str(reply)
+                return str(reply) if reply else "Агент не дал ответа."
             except json.JSONDecodeError:
                 return result.stdout.strip()
         else:
@@ -235,6 +237,11 @@ def main():
     print("   (Ctrl+C для выхода)")
     print()
     
+    # Стартовая голосовая фраза — чтобы пользователь знал, что говорилка работает
+    if tts_model:
+        play_beep(880.0, 0.15)
+        speak(tts_model, "Голосовое общение активировано")
+    
     # Запуск захвата аудио
     try:
         with sd.RawInputStream(
@@ -283,6 +290,9 @@ def main():
                                         active_session = False
                                         print("\n💤 Сессия завершена пользователем.")
                                         play_beep(300.0, 0.3)
+                                        # Прощальная голосовая фраза
+                                        if tts_model:
+                                            speak(tts_model, "Голосовое общение отключено")
                                         print("\n🟢 Слушаю фон (назовите имя для старта)...")
                                         continue
                                     
