@@ -20,19 +20,34 @@ import signal
 
 import sounddevice as sd
 import numpy as np
+import logging
+
+# --- Логирование Ошибок ---
+LOG_FILE = os.path.join(os.path.dirname(__file__), "voice_bridge_errors.log")
+logging.basicConfig(
+    filename=LOG_FILE,
+    level=logging.ERROR,
+    format='%(asctime)s [%(levelname)s] %(message)s'
+)
 
 # --- Конфигурация ---
 VOSK_MODEL_PATH = os.path.join(os.path.dirname(__file__), "models", "vosk-ru")
 SAMPLE_RATE = 16000
 BLOCK_SIZE = 8000  # 0.5 сек блоки
-SILENCE_TIMEOUT = 3.5  # секунд тишины для завершения фразы (увеличено для длинных реплик)
+SILENCE_TIMEOUT = 2.0  # секунд тишины для завершения фразы (уменьшено для быстродействия)
 OPENCLAW_CMD = "openclaw"
 WAKE_WORDS = ["товарищ", "компьютер", "система", "макс", "максим"]
 STOP_WORDS = ["пока", "отбой", "хватит", "стоп"]
+FILLERS = ["Угу...", "Секунду...", "Так...", "Понял..."]
 
 # --- Глобальные переменные ---
 audio_queue = queue.Queue()
-is_speaking = False  # True когда TTS воспроизводит ответ
+speak_lock = threading.Lock()
+speak_count_lock = threading.Lock()
+speak_active_count = 0
+
+def is_audio_muted():
+    return speak_active_count > 0
 
 
 def init_vosk():
@@ -43,7 +58,9 @@ def init_vosk():
     try:
         model = Model(model_path=VOSK_MODEL_PATH)
     except Exception as e:
-        print(f"❌ Ошибка загрузки модели Vosk: {e}")
+        error_msg = f"Ошибка загрузки модели Vosk: {e}"
+        print(f"❌ {error_msg}")
+        logging.error(error_msg, exc_info=True)
         sys.exit(1)
         
     recognizer = KaldiRecognizer(model, SAMPLE_RATE)
@@ -77,6 +94,17 @@ def play_beep(freq=440.0, duration=0.2):
     except Exception:
         pass
 
+
+def play_filler(tts_model):
+    """Озвучить короткий филлер ('Так...', 'Секунду...')."""
+    import random
+    import threading
+    if tts_model:
+        filler = random.choice(FILLERS)
+        # Запускаем в отдельном потоке, чтобы не блокировать отправку запроса
+        t = threading.Thread(target=speak, args=(tts_model, filler))
+        t.start()
+
 def sanitize_for_tts(text):
     """Очистить текст от символов, которые Silero TTS не умеет читать (эмодзи, латиница)."""
     import re
@@ -86,49 +114,66 @@ def sanitize_for_tts(text):
 
 def speak(tts_model, text):
     """Озвучить текст через Silero TTS и воспроизвести через колонки."""
-    global is_speaking
+    global speak_active_count
     import torch
     
     if not text.strip():
         return
     
-    is_speaking = True
-    # Разбиваем длинный текст на предложения для быстрого начала воспроизведения
-    sentences = split_sentences(text)
-    
-    for sentence in sentences:
-        try:
-            sentence = sanitize_for_tts(sentence)
-            if not sentence.strip():
-                continue
-                
-            # Если в предложении нет ни одной русской буквы (только цифры '1.', '2.'), 
-            # Silero выдаст ValueError. Такие строки надо пропустить.
-            import re
-            if not re.search(r'[а-яА-ЯёЁ]', sentence):
-                continue
+    with speak_count_lock:
+        speak_active_count += 1
+        
+    try:
+        with speak_lock:
+            # Разбиваем длинный текст на предложения для потокового воспроизведения
+            sentences = split_sentences(text)
             
-            # Генерируем аудио
-            audio = tts_model.apply_tts(
-                text=sentence,
-                speaker='baya',  # Женский голос (можно: aidar, baya, kseniya, xenia, eugene)
-                sample_rate=48000
-            )
-            
-            # Воспроизводим с отступом (padding), чтобы не проглатывать окончания
-            import numpy as np
-            audio_np = audio.numpy()
-            padding = np.zeros(int(48000 * 0.3), dtype=audio_np.dtype)
-            audio_np_padded = np.concatenate((audio_np, padding))
-            sd.play(audio_np_padded, samplerate=48000)
-            sd.wait()
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            print(f"⚠️ Ошибка TTS на фрагменте '{sentence}': {e}")
-            print(f"⚠️ Ошибка TTS на фрагменте '{sentence}': {e}")
-            
-    is_speaking = False
+            for sentence in sentences:
+                try:
+                    sentence = sanitize_for_tts(sentence)
+                    if not sentence.strip():
+                        continue
+                        
+                    # Если в предложении нет ни одной русской буквы (только цифры '1.', '2.'), 
+                    # Silero выдаст ValueError. Такие строки надо пропустить.
+                    import re
+                    if not re.search(r'[а-яА-ЯёЁ]', sentence):
+                        continue
+                    
+                    # Генерируем аудио
+                    audio = tts_model.apply_tts(
+                        text=sentence,
+                        speaker='baya',  # Женский голос (можно: aidar, baya, kseniya, xenia, eugene)
+                        sample_rate=48000
+                    )
+                    
+                    # Воспроизводим с отступом (padding), чтобы не проглатывать окончания
+                    import numpy as np
+                    audio_np = audio.numpy()
+                    padding = np.zeros(int(48000 * 0.3), dtype=audio_np.dtype)
+                    audio_np_padded = np.concatenate((audio_np, padding))
+                    sd.play(audio_np_padded, samplerate=48000)
+                    sd.wait()
+                except Exception as e:
+                    import traceback
+                    traceback.print_exc()
+                    error_msg = f"Ошибка TTS на фрагменте '{sentence}': {e}"
+                    print(f"⚠️ {error_msg}")
+                    logging.error(error_msg, exc_info=True)
+                    
+            import time
+            time.sleep(2.5)  # Увеличенная задержка (грейс-период) после завершения речи для подавления эха
+
+            # Очищаем очередь от аудио, которое могло "просочиться"
+            while not audio_queue.empty():
+                try:
+                    audio_queue.get_nowait()
+                except queue.Empty:
+                    break
+
+    finally:
+        with speak_count_lock:
+            speak_active_count -= 1
 
 
 def split_sentences(text):
@@ -194,7 +239,7 @@ def audio_callback(indata, frames, time_info, status):
     """Callback для захвата аудио с микрофона."""
     if status:
         print(f"⚠️ Audio: {status}")
-    if not is_speaking:  # Не слушаем пока говорим
+    if not is_audio_muted():  # Не слушаем пока говорим
         audio_queue.put(bytes(indata))
 
 
@@ -291,6 +336,10 @@ def main():
                                 # Звуковой сигнал (писк), что мы закончили слушать и начали думать
                                 play_beep(440.0, 0.2)
                                 
+                                # Включаем звук-филлер для сглаживания задержки
+                                # if tts_model and active_session:
+                                #     play_filler(tts_model)
+                                
                                 # Получаем ответ от агента
                                 reply = send_to_openclaw(final_text)
                                 print(f"🤖 Агент: {reply}")
@@ -313,7 +362,7 @@ def main():
                                 play_beep(880.0, 0.1)
                     continue
                 
-                if is_speaking:
+                if is_audio_muted():
                     continue
                 
                 # Распознаём речь
@@ -335,8 +384,11 @@ def main():
     except KeyboardInterrupt:
         print("\n\n🔴 Voice Bridge остановлен. До свидания, товарищ!")
     except Exception as e:
-        print(f"\n❌ Ошибка: {e}")
+        error_msg = f"Фатальная ошибка захвата аудио: {e}"
+        print(f"❌ {error_msg}")
+        logging.critical(error_msg, exc_info=True)
         print("Проверьте подключение микрофона: python3 voice_bridge.py --list-devices")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
