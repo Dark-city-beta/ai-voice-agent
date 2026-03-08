@@ -516,14 +516,14 @@ def handle_music_command(text, tts_model):
         return True
     
     # --- ИЗБРАННОЕ: ДОБАВИТЬ ---
-    if re.search(r'добав\w*\s*(эту\s*)?(станц|радио)?\s*(в\s*)?избранн', normalized):
+    if re.search(r'(добавь|добав|добавить|сохрани|сохранить)\s*(эту\s*)?(станц\w*|радио\w*|музык\w*|её|ее)?\s*(в\s*)?(избранн\w*|любим\w*|сохраненн\w*)', normalized):
         print("🎵 [LOCAL] Добавить в избранное")
         call_radio_player("favorite_add")
         play_cached("music_fav_add")
         return True
     
     # --- ИЗБРАННОЕ: УДАЛИТЬ ---
-    if re.search(r'удал\w*\s*(эту\s*)?(станц|радио)?\s*(из\s*)?избранн', normalized):
+    if re.search(r'(удали|удалить|убери|убрать)\s*(эту\s*)?(станц\w*|радио\w*|музык\w*|её|ее)?\s*(из\s*)?(избранн\w*|любим\w*|сохраненн\w*)', normalized):
         print("🎵 [LOCAL] Удалить из избранного")
         call_radio_player("favorite_remove")
         play_cached("music_fav_remove")
@@ -604,6 +604,33 @@ def list_devices():
     print()
 
 
+PID_FILE = "/tmp/voice_bridge.pid"
+
+
+def _check_pid_lock():
+    """Проверить PID-lock: не запущен ли уже другой экземпляр."""
+    if os.path.exists(PID_FILE):
+        try:
+            with open(PID_FILE, 'r') as f:
+                old_pid = int(f.read().strip())
+            # Проверяем, жив ли процесс
+            os.kill(old_pid, 0)  # signal 0 = проверка существования
+            print(f"❌ Voice Bridge уже запущен (PID {old_pid}). Выход.")
+            print(f"   Для принудительного перезапуска: pkill -f voice_bridge.py")
+            sys.exit(1)
+        except (ProcessLookupError, ValueError):
+            # Процесс мёртв — удаляем stale lock
+            os.remove(PID_FILE)
+        except PermissionError:
+            # Процесс жив, но другого пользователя
+            print(f"❌ Voice Bridge уже запущен другим пользователем. Выход.")
+            sys.exit(1)
+    
+    # Записываем наш PID
+    with open(PID_FILE, 'w') as f:
+        f.write(str(os.getpid()))
+
+
 def main():
     parser = argparse.ArgumentParser(description="Voice Bridge — голосовой интерфейс OpenClaw")
     parser.add_argument("--list-devices", action="store_true", help="Показать аудиоустройства")
@@ -616,6 +643,9 @@ def main():
     if args.list_devices:
         list_devices()
         return
+    
+    # Защита от запуска нескольких экземпляров
+    _check_pid_lock()
     
     print("=" * 50)
     print("🎙️  VOICE BRIDGE — Голосовой мост OpenClaw")
@@ -794,6 +824,20 @@ def main():
                                     play_beep(880.0, 0.1)
                                     continue
                                 
+                                # 🎵 Музыкальный режим: если mpv играет — игнорируем всё кроме плеерных команд
+                                if _is_mpv_running():
+                                    print("   [ 🎵 Музыкальный режим: фраза не является командой плеера — игнорирую ]")
+                                    # Снимаем ducking
+                                    try:
+                                        subprocess.run(["pkill", "-CONT", "mpv"], stderr=subprocess.DEVNULL)
+                                    except Exception:
+                                        pass
+                                    if active_session:
+                                        print("\n🟢 Слушаю дальше (🎵 музыкальный режим)...")
+                                    else:
+                                        print("\n🟢 Слушаю фон (🎵 музыкальный режим)...")
+                                    continue
+                                
                                 print("⏳ Агент обдумывает ответ... (это может занять 5-15 секунд, не выключайте)")
                                 
                                 # Звуковой сигнал (писк), что мы закончили слушать и начали думать
@@ -879,6 +923,11 @@ def main():
         subprocess.run(["pkill", "-f", "openclaw agent --session-id voice_bridge"], stderr=subprocess.DEVNULL)
         subprocess.run(["pkill", "-9", "-f", "mpv --no-video"], stderr=subprocess.DEVNULL)
         subprocess.run(["pkill", "-9", "-f", "while true; do mpv"], stderr=subprocess.DEVNULL)
+        # Удаляем PID-lock
+        try:
+            os.remove(PID_FILE)
+        except Exception:
+            pass
         print("🗑️  Сессия очищена при выходе.")
 
 
