@@ -76,6 +76,7 @@ def play_beep(freq=440.0, duration=0.2):
         t = np.linspace(0, duration, int(TTS_SAMPLE_RATE * duration), endpoint=False)
         beep = 0.5 * np.sin(2 * np.pi * freq * t)
         sd.play(beep.astype(np.float32), samplerate=TTS_SAMPLE_RATE)
+        sd.wait()
     except Exception:
         pass
 
@@ -95,12 +96,12 @@ def play_cached(name):
             audio = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32767.0
         sd.play(audio, samplerate=rate)
         sd.wait()
-        is_speaking = False
         return True
     except Exception as e:
         print(f"⚠️ Ошибка воспроизведения кэша '{name}': {e}")
-        is_speaking = False
         return False
+    finally:
+        is_speaking = False
 
 def sanitize_for_tts(text):
     """Очистить текст от символов, которые Silero TTS не умеет читать (эмодзи, латиница)."""
@@ -188,42 +189,43 @@ def speak(tts_model, text):
         return
     
     is_speaking = True
-    # Разбиваем длинный текст на предложения для быстрого начала воспроизведения
-    sentences = split_sentences(text)
-    
-    for sentence in sentences:
-        try:
-            sentence = sanitize_for_tts(sentence)
-            # Конвертируем цифры в русские слова ДО отправки в TTS
-            sentence = digits_to_russian_words(sentence)
-            if not sentence.strip():
-                continue
+    try:
+        # Разбиваем длинный текст на предложения для быстрого начала воспроизведения
+        sentences = split_sentences(text)
+        
+        for sentence in sentences:
+            try:
+                sentence = sanitize_for_tts(sentence)
+                # Конвертируем цифры в русские слова ДО отправки в TTS
+                sentence = digits_to_russian_words(sentence)
+                if not sentence.strip():
+                    continue
+                    
+                # Если в предложении нет ни одной русской буквы — пропускаем
+                import re
+                if not re.search(r'[а-яА-ЯёЁ]', sentence):
+                    continue
                 
-            # Если в предложении нет ни одной русской буквы — пропускаем
-            import re
-            if not re.search(r'[а-яА-ЯёЁ]', sentence):
-                continue
-            
-            # Генерируем аудио
-            audio = tts_model.apply_tts(
-                text=sentence,
-                speaker='baya',  # Женский голос (можно: aidar, baya, kseniya, xenia, eugene)
-                sample_rate=TTS_SAMPLE_RATE
-            )
-            
-            # Воспроизводим с отступом (padding), чтобы не проглатывать окончания
-            import numpy as np
-            audio_np = audio.numpy()
-            padding = np.zeros(int(TTS_SAMPLE_RATE * 0.15), dtype=audio_np.dtype)
-            audio_np_padded = np.concatenate((audio_np, padding))
-            sd.play(audio_np_padded, samplerate=TTS_SAMPLE_RATE)
-            sd.wait()
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            print(f"⚠️ Ошибка TTS на фрагменте '{sentence}': {e}")
-            
-    is_speaking = False
+                # Генерируем аудио
+                audio = tts_model.apply_tts(
+                    text=sentence,
+                    speaker='baya',  # Женский голос (можно: aidar, baya, kseniya, xenia, eugene)
+                    sample_rate=TTS_SAMPLE_RATE
+                )
+                
+                # Воспроизводим с отступом (padding), чтобы не проглатывать окончания
+                import numpy as np
+                audio_np = audio.numpy()
+                padding = np.zeros(int(TTS_SAMPLE_RATE * 0.15), dtype=audio_np.dtype)
+                audio_np_padded = np.concatenate((audio_np, padding))
+                sd.play(audio_np_padded, samplerate=TTS_SAMPLE_RATE)
+                sd.wait()
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                print(f"⚠️ Ошибка TTS на фрагменте '{sentence}': {e}")
+    finally:
+        is_speaking = False
 
 
 def split_sentences(text):
@@ -297,10 +299,11 @@ def send_to_openclaw(text):
         "электроника": "edm", "едм": "edm"
     }
     
-    # Применяем замены к распознанному тексту
+    import re
+    # Применяем замены к распознанному тексту только как отдельные слова
     normalized_text = text.lower()
     for ru, eng in phonetic_fixes.items():
-        normalized_text = normalized_text.replace(ru, eng)
+        normalized_text = re.sub(r'\b' + ru + r'\b', eng, normalized_text)
     
     print(f"📤 Отправляю: {normalized_text}")
     
@@ -325,7 +328,11 @@ def send_to_openclaw(text):
             
             if result.returncode == 0:
                 try:
-                    data = json.loads(result.stdout)
+                    # Отсекаем системные предупреждения (Config warnings, gateway timeout и т.д.)
+                    stdout_str = result.stdout.strip()
+                    if "{" in stdout_str:
+                        stdout_str = stdout_str[stdout_str.find("{"):]
+                    data = json.loads(stdout_str)
                     # Извлекаем текст из payloads (OpenClaw оборачивает в result)
                     result_data = data.get("result", data)
                     payloads = result_data.get("payloads", data.get("payloads", []))
@@ -338,6 +345,10 @@ def send_to_openclaw(text):
                     else:
                         reply = data.get("reply", data.get("message", data.get("text", result.stdout)))
                     reply = str(reply) if reply else "Агент не дал ответа."
+                    
+                    # Удаляем внутренние мысли агента (<thought>...</thought>), чтобы их не читал TTS
+                    import re
+                    reply = re.sub(r'<thought>.*?</thought>', '', reply, flags=re.DOTALL).strip()
                     
                     # Проверяем: не является ли «ответ» на самом деле ошибкой rate-limit
                     if _is_rate_limit_response(reply):
@@ -353,7 +364,8 @@ def send_to_openclaw(text):
                     
                     return reply
                 except json.JSONDecodeError:
-                    return result.stdout.strip()
+                    print(f"⚠️ Ошибка JSON парсинга. Сырой ответ: {result.stdout}")
+                    return "Произошла системная ошибка. Не могу распознать ответ агента."
             else:
                 stderr = result.stderr.lower()
                 # Rate-limit в stderr — ретраим
@@ -409,9 +421,9 @@ def call_radio_player(command, **kwargs):
 def _is_mpv_running():
     """Проверить, запущен ли mpv."""
     try:
-        result = subprocess.run(["pgrep", "-f", "mpv --no-video"], capture_output=True)
+        result = subprocess.run(["pgrep", "-x", "mpv"], capture_output=True)
         return result.returncode == 0
-    except:
+    except Exception:
         return False
 
 
@@ -448,9 +460,10 @@ def handle_music_command(text, tts_model):
         "электроника": "edm", "едм": "edm"
     }
     
+    import re
     normalized = lower
     for ru, eng in phonetic_fixes.items():
-        normalized = normalized.replace(ru, eng)
+        normalized = re.sub(r'\b' + ru + r'\b', eng, normalized)
     
     # --- СТОП / ВЫКЛЮЧИ МУЗЫКУ ---
     if re.search(r'(выключи|останови|убери)\s*(музыку|радио|стрим|плеер)', normalized) or \
@@ -534,7 +547,7 @@ def handle_music_command(text, tts_model):
     if fav_specific:
         station_name = fav_specific.group(3).strip()
         print(f"🎵 [LOCAL] Включить из избранного: {station_name}")
-        call_radio_player("play_favorites", query=station_name)
+        call_radio_player("play_favorites", name=station_name)
         play_cached("music_fav_play_one")
         return True
     
@@ -632,6 +645,7 @@ def _check_pid_lock():
 
 
 def main():
+    global is_speaking
     parser = argparse.ArgumentParser(description="Voice Bridge — голосовой интерфейс OpenClaw")
     parser.add_argument("--list-devices", action="store_true", help="Показать аудиоустройства")
     parser.add_argument("--device", type=int, default=None, help="ID устройства ввода (микрофон)")
@@ -857,13 +871,22 @@ def main():
                                 
                                 # Озвучиваем ответ
                                 if tts_model and reply:
-                                    def talk_and_resume():
-                                        speak(tts_model, reply)
-                                        # Снимаем процесс с паузы после окончания речи
+                                    is_speaking = True  # Set BEFORE thread starts to prevent race condition
+                                    def talk_and_resume(reply_text=reply):
                                         try:
-                                            subprocess.run(["pkill", "-CONT", "mpv"], stderr=subprocess.DEVNULL)
-                                        except Exception:
-                                            pass
+                                            speak(tts_model, reply_text)
+                                        except Exception as e:
+                                            import traceback
+                                            traceback.print_exc()
+                                            print(f"⚠️ TTS thread crashed: {e}")
+                                        finally:
+                                            global is_speaking
+                                            is_speaking = False
+                                            # Снимаем процесс с паузы после окончания речи
+                                            try:
+                                                subprocess.run(["pkill", "-CONT", "mpv"], stderr=subprocess.DEVNULL)
+                                            except Exception:
+                                                pass
                                             
                                     speak_thread = threading.Thread(target=talk_and_resume)
                                     speak_thread.start()
