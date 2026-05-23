@@ -1,4 +1,9 @@
 venv/
+.venv/
 __pycache__/
+*.pyc
 models/vosk-ru/
 *.wav
+*.log
+.env
+*.token
