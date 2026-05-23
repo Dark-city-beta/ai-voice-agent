@@ -49,6 +49,8 @@ FRAME_MS = 20
 VAD_FRAME_SAMPLES = VAD_RATE * FRAME_MS // 1000
 FRAME_BYTES = VAD_FRAME_SAMPLES * 2
 HERMES_CONFIG = Path.home() / ".hermes" / "config.yaml"
+CONTROL_MUTE_FILE = Path(__file__).resolve().parent / ".voice_mute"
+CONTROL_RESET_FILE = Path(__file__).resolve().parent / ".voice_reset"
 
 
 def find_shem_boy_input():
@@ -349,7 +351,7 @@ class VoiceLoop:
     def audio_callback(self, indata, frames, time_info, status):
         if status and self.args.debug_audio_status:
             print(f"[audio status] {status}", flush=True)
-        if self.listening_muted:
+        if self.listening_muted or CONTROL_MUTE_FILE.exists():
             return
         if self.stt_lock.locked() and self.args.drop_mic_during_stt:
             return
@@ -401,6 +403,18 @@ class VoiceLoop:
 
         print("[vad] listening... говори свободно, я сам пойму паузу.", flush=True)
         while not self.stop.is_set():
+            if CONTROL_RESET_FILE.exists():
+                CONTROL_RESET_FILE.unlink(missing_ok=True)
+                while True:
+                    try:
+                        self.audio_q.get_nowait()
+                    except Exception:
+                        break
+                pre.clear(); candidate.clear(); speech = []
+                triggered = False
+                speech_count = silence_count = consecutive_start = 0
+                print("[vad] reset by control", flush=True)
+                continue
             try:
                 frame = self.audio_q.get(timeout=0.5)
             except queue.Empty:
