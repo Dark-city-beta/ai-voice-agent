@@ -1,59 +1,134 @@
-# Hermes Voice Bridge v0.3
+# Hermes Govorilka 0.3
 
-Текущая рабочая сборка локальной говорилки Hermes для DARK.
+Локальная голосовая говорилка для Hermes Agent: микрофон на Ubuntu-сервере, локальный STT, локальный Silero TTS, колонки и LAN-пульт с Windows.
 
 ## Что внутри
 
-- `local_voice_vad_loop.py` — основная новая говорилka.
-- `voice_bridge_hermes_v0.3.py` — стабильный wrapper entrypoint.
-- `mic_calibrate_vad.py` — калибровка микрофона/VAD.
-- `run_local_voice.sh` — быстрый запуск на текущей машине.
+- `local_voice_vad_loop.py` - основной голосовой цикл.
+- `silero_tts_worker.py` - долгоживущий offline Silero TTS worker.
+- `run_local_voice.sh` - запуск голосового цикла на Ubuntu.
+- `voice_controller_server.py` - LAN HTTP API для Windows-пульта.
+- `voice_control_server.py` - совместимое имя того же control API.
+- `windows/GovorilkaTray/GovorilkaTray.exe` - готовый Windows-пульт.
 
-## Текущая архитектура
+## Архитектура
 
-- Микрофон: USB `SHEM-BOY`, sounddevice input `7`.
-- Захват: 44100 Hz, ресемпл в 16000 Hz для WebRTC VAD.
-- Endpointing: переменная длина фразы, без фиксированных чанков.
-- STT: `faster-whisper`, русский язык.
-- LLM: прямой OpenAI-compatible provider API из `~/.hermes/config.yaml`, без запуска `hermes chat` на каждый ход.
-- TTS: Edge TTS, ALSA playback через `aplay -D plughw:0,0`.
-- UX: стартовый MP3 при запуске прослушки, финальный MP3 при остановке, без системных звуков между обычными репликами.
+```text
+Windows GovorilkaTray.exe
+        |
+        | LAN HTTP :8766
+        v
+Ubuntu voice_controller_server.py
+        |
+        v
+local_voice_vad_loop.py
+        |
+        +-- USB mic -> WebRTC VAD -> faster-whisper -> Hermes CLI
+        +-- Hermes reply -> Silero TTS worker -> ALSA speakers
+```
 
-## Основные оптимизации v0.3
+## Основные решения 0.3
 
-- Убран тяжёлый per-turn `hermes chat -q` CLI из горячего голосового контура.
-- Добавлен `--llm-backend direct` по умолчанию.
-- Ответы ограничены для голосового режима: одно короткое предложение.
-- Markdown/emoji/спецсимволы очищаются перед TTS.
-- TTS начинает первый готовый chunk без ожидания полной склейки ответа.
-- Пауза отбивки речи увеличена, чтобы не резать мысли пользователя.
+- Убран Edge/Microsoft TTS из горячего пути.
+- Silero `v4_ru.pt` работает локально и держится в памяти отдельным worker-процессом.
+- Основной Python берётся из Hermes venv, где есть `sounddevice`, `webrtcvad`, `faster-whisper`, `fastapi`, `uvicorn`.
+- Torch берётся из отдельного Cat-books venv через `silero_tts_worker.py`, чтобы не ломать окружение Hermes.
+- USB-микрофон работает на `48000 Hz`; дальше аудио ресемплится в `16000 Hz` для VAD/STT.
+- Быстрый голосовой режим Hermes использует `hermes chat --quiet --ignore-rules --max-turns 1`, чтобы бытовые голосовые реплики не ждали полный агентный контур.
+- Технические ошибки Hermes пишутся в лог, но не читаются вслух.
+- Фильтруются типовые hallucinations Whisper на тишине: `спасибо за просмотр`, `подписывайтесь`, `продолжение следует`, `thanks for watching`.
 
-## Быстрый запуск
+## Ubuntu запуск
+
+Пример с текущего домашнего сервера:
 
 ```bash
 ./run_local_voice.sh
 ```
 
-Или явно:
+Ручной эквивалент:
 
 ```bash
-python3 local_voice_vad_loop.py \
+/home/dark/.hermes/hermes-agent/venv/bin/python local_voice_vad_loop.py \
   --input-device 7 \
-  --samplerate 44100 \
+  --samplerate 48000 \
   --model base \
-  --preload-stt \
   --output-device plughw:0,0 \
-  --llm-backend direct
+  --level-interval 1.0 \
+  --llm-backend cli \
+  --hermes-timeout 55 \
+  --tts-python "/mnt/city17/Free project/Cat-books/catbooks-2.0/.venv-cpu/bin/python" \
+  --tts-worker /home/dark/.hermes/scripts/silero_tts_worker.py
 ```
 
-## Калибровка микрофона
+## Control API
+
+Запуск:
 
 ```bash
-python3 mic_calibrate_vad.py --input-device 7 --seconds 30 --vad 2
+/home/dark/.hermes/hermes-agent/venv/bin/python -m uvicorn voice_controller_server:APP --host 0.0.0.0 --port 8766
 ```
 
-## Важные замечания
+Основные команды:
 
-- Файл читает `~/.hermes/config.yaml` для provider API. Секреты не должны попадать в репозиторий.
-- Текущий главный резерв ускорения: заменить Edge TTS на локальный Piper/Silero или streaming TTS.
-- Токены GitHub/API не хранить в репозитории.
+```bash
+curl http://127.0.0.1:8766/status
+curl -X POST http://127.0.0.1:8766/voice/start
+curl -X POST http://127.0.0.1:8766/voice/stop
+curl -X POST http://127.0.0.1:8766/mic/mute
+curl -X POST http://127.0.0.1:8766/mic/unmute
+curl -X POST http://127.0.0.1:8766/speaker/mute
+curl -X POST http://127.0.0.1:8766/speaker/unmute
+```
+
+Не выставляй этот API в интернет. Это LAN-пульт.
+
+## Windows пульт
+
+Готовая сборка:
+
+```text
+windows/GovorilkaTray/GovorilkaTray.exe
+```
+
+Запуск:
+
+```text
+windows/GovorilkaTray/Start-GovorilkaTray.cmd
+```
+
+Хоткеи:
+
+- `Ctrl+Alt+G` - включить/выключить говорилку.
+- `Ctrl+Alt+M` - mute/unmute микрофон.
+- `Ctrl+Alt+S` - mute/unmute колонки.
+
+Адрес сервера меняется в:
+
+```text
+windows/GovorilkaTray/config.json
+```
+
+## Проверки
+
+Список аудиоустройств:
+
+```bash
+/home/dark/.hermes/hermes-agent/venv/bin/python local_voice_vad_loop.py --list-devices
+```
+
+Тест локального TTS:
+
+```bash
+./run_local_voice.sh --say-test --start-sound ""
+```
+
+Тест Hermes без озвучки:
+
+```bash
+./run_local_voice.sh --ask-test "проверка связи, ответь коротко" --no-tts
+```
+
+## Важно
+
+Секреты, API keys и GitHub tokens не должны попадать в репозиторий.

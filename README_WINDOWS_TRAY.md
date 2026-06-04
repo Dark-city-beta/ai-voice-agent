@@ -1,84 +1,49 @@
-# Windows Tray Controller для говорилки
+# Windows Govorilka Tray
 
-Компактный Windows 11 tray-клиент для управления Linux/Hermes говорилкой по локальной сети.
+Готовый Windows-пульт для управления Ubuntu-сервером с Hermes Govorilka 0.3.
 
-## Что умеет
-
-- Включить говорилку.
-- Выключить говорилку.
-- Mute микрофона.
-- Unmute микрофона.
-- Показывает статус цветом в трее:
-  - зелёный: говорилка включена;
-  - серый: выключена;
-  - жёлтый: mute;
-  - красный: нет связи.
-
-## Архитектура
-
-- На Linux/Hermes машине запускается `voice_control_server.py`.
-- На Windows запускается `HermesVoiceTray.exe`.
-- Windows-клиент ходит в Linux API по LAN:
-  - `GET /health`
-  - `POST /start`
-  - `POST /stop`
-  - `POST /mute`
-  - `POST /unmute`
-
-Текущий IP Linux-хоста по умолчанию:
+## Где лежит
 
 ```text
-http://192.168.31.200:8766
+windows/GovorilkaTray/GovorilkaTray.exe
+windows/GovorilkaTray/Start-GovorilkaTray.cmd
+windows/GovorilkaTray/config.json
 ```
 
-Если IP изменится, в трее: `Настройки` → поменять URL.
+## Запуск
 
-## Запуск Linux control server
-
-На Linux/Hermes машине из папки проекта:
-
-```bash
-python3 voice_control_server.py --host 0.0.0.0 --port 8766
-```
-
-Опционально можно задать простой LAN-token:
-
-```bash
-VOICE_CONTROL_TOKEN=your-local-token python3 voice_control_server.py --host 0.0.0.0 --port 8766
-```
-
-Тогда в Windows tray app надо открыть `Настройки` и вписать этот token.
-
-Проверка:
-
-```bash
-curl http://127.0.0.1:8766/health
-```
-
-## Сборка EXE на Windows 11
-
-1. Скопировать репозиторий/папку на Windows.
-2. Запустить:
-
-```bat
-build_windows_tray.bat
-```
-
-3. Готовый файл будет здесь:
+Двойной клик:
 
 ```text
-dist\HermesVoiceTray.exe
+Start-GovorilkaTray.cmd
 ```
 
-## Настройки клиента
-
-Файл настроек создаётся автоматически:
+Или напрямую:
 
 ```text
-%APPDATA%\HermesVoiceTray\config.json
+GovorilkaTray.exe
 ```
 
-Пример:
+При запуске открывается маленькое окно с кнопками. Окно можно свернуть в трей.
+
+## Кнопки
+
+- `Включить / выключить`
+- `Микрофон mute`
+- `Колонки mute`
+- `Обновить статус`
+- `Свернуть в трей`
+- `Выход`
+
+## Горячие клавиши
+
+- `Ctrl+Alt+G` - включить/выключить говорилку.
+- `Ctrl+Alt+M` - mute/unmute микрофон.
+- `Ctrl+Alt+S` - mute/unmute колонки.
+
+## Настройка IP
+
+По умолчанию:
 
 ```json
 {
@@ -86,6 +51,10 @@ dist\HermesVoiceTray.exe
 }
 ```
 
-## Важно
+Если сервер переехал, измени `config.json` рядом с `.exe`.
 
-Не выставлять `voice_control_server.py` в интернет. Это LAN-контроллер, не публичный API.
+## Требования
+
+Пульт собран как `.NET Framework` WinForms-приложение без сторонних библиотек. На обычной Windows 10/11 должен запускаться без установки Python.
+
+Если Windows SmartScreen предупреждает о неизвестном приложении, это ожидаемо: файл собран локально и не подписан.

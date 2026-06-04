@@ -2,14 +2,10 @@
 """
 Hermes local voice VAD loop — variable-length utterances, Russian STT, TTS playback.
 
-MVP:
-- continuous microphone stream via sounddevice
-- WebRTC VAD endpointing, no fixed 7-second chunks
-- faster-whisper final transcription after utterance endpoint
-- Hermes CLI call
-- Edge TTS by sentence chunks
-- playback via ffmpeg -> aplay
-- optional barge-in: if user speaks during playback, stop current playback
+Restoration target:
+- keep the old Hermes-aware dialogue/session/context behavior;
+- preserve timings/voice-flow semantics as much as possible;
+- replace only the broken Microsoft/Edge TTS path with local offline male Silero.
 
 Run:
   python3 ~/.hermes/scripts/local_voice_vad_loop.py --list-devices
@@ -49,15 +45,42 @@ FRAME_MS = 20
 VAD_FRAME_SAMPLES = VAD_RATE * FRAME_MS // 1000
 FRAME_BYTES = VAD_FRAME_SAMPLES * 2
 HERMES_CONFIG = Path.home() / ".hermes" / "config.yaml"
-CONTROL_MUTE_FILE = Path(__file__).resolve().parent / ".voice_mute"
-CONTROL_RESET_FILE = Path(__file__).resolve().parent / ".voice_reset"
+VOICE_SESSION_ID_FILE = Path('/tmp/hermes_voice_session_id.txt')
+VOICE_CONTEXT_FILE = Path('/tmp/hermes_voice_shared_context.txt')
+SILERO_MODEL_PATH = Path('/home/dark/.cache/torch/hub/snakers4_silero-models_master/src/silero/model/v4_ru.pt')
+DEFAULT_TTS_PYTHON = Path("/mnt/city17/Free project/Cat-books/catbooks-2.0/.venv-cpu/bin/python")
+DEFAULT_TTS_WORKER = Path("/home/dark/.hermes/scripts/silero_tts_worker.py")
+CONTROL_DIR = Path("/tmp/hermes_voice_control")
+MIC_MUTE_FILE = CONTROL_DIR / "mic_muted"
+SPEAKER_MUTE_FILE = CONTROL_DIR / "speaker_muted"
+STATE_FILE = CONTROL_DIR / "state.json"
+
+WHISPER_HALLUCINATIONS = {
+    "",
+    ".",
+    "...",
+    "спасибо",
+    "спасибо за просмотр",
+    "подписывайтесь",
+    "подписывайтесь на канал",
+    "продолжение следует",
+    "субтитры сделал",
+    "субтитры создавал",
+    "thank you",
+    "thanks",
+    "thanks for watching",
+    "subscribe",
+    "bye",
+}
 
 
 def find_shem_boy_input():
-    """Prefer the known-good USB mic on this host when no input device is specified."""
+    """Prefer the current USB microphone when no input device is specified."""
+    preferred_markers = ("SHEM-BOY", "USB Audio", "USB")
     try:
         for i, d in enumerate(sd.query_devices()):
-            if d.get("max_input_channels", 0) > 0 and "SHEM-BOY" in d.get("name", ""):
+            name = d.get("name", "")
+            if d.get("max_input_channels", 0) > 0 and any(marker in name for marker in preferred_markers):
                 return i
     except Exception:
         pass
@@ -81,6 +104,40 @@ def write_wav(path: Path, pcm: bytes):
         w.setsampwidth(2)
         w.setframerate(VAD_RATE)
         w.writeframes(pcm)
+
+
+def control_flag(path: Path) -> bool:
+    try:
+        return path.exists()
+    except Exception:
+        return False
+
+
+def write_state(state: str, **extra):
+    try:
+        CONTROL_DIR.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "ok": True,
+            "state": state,
+            "pid": os.getpid(),
+            "mic_muted": control_flag(MIC_MUTE_FILE),
+            "speaker_muted": control_flag(SPEAKER_MUTE_FILE),
+            "ts": time.time(),
+        }
+        payload.update(extra)
+        STATE_FILE.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def is_whisper_hallucination(text: str) -> bool:
+    normalized = re.sub(r"\s+", " ", (text or "").strip().lower())
+    normalized = normalized.strip(" .,!?:;«»\"'")
+    if normalized in WHISPER_HALLUCINATIONS:
+        return True
+    if len(normalized) <= 2:
+        return True
+    return False
 
 
 def play_tone(output_device: str, freq: int, duration_ms: int = 120, volume: float = 0.18):
@@ -155,7 +212,6 @@ def split_sentences_ru(text: str, max_len: int = 110):
             buf = p
     if buf:
         out.append(buf)
-    # Split remaining too-long chunks on commas/spaces conservatively
     final = []
     for chunk in out:
         if len(chunk) <= max_len:
@@ -175,13 +231,103 @@ def split_sentences_ru(text: str, max_len: int = 110):
     return final
 
 
+class SileroTTSClient:
+    def __init__(self, python_path: Path, worker_path: Path):
+        self.python_path = Path(python_path)
+        self.worker_path = Path(worker_path)
+        self.proc = None
+        self.lock = threading.Lock()
+        self.responses = queue.Queue()
+        self.reader = None
+
+    def _reader_loop(self):
+        while self.proc and self.proc.stdout:
+            line = self.proc.stdout.readline()
+            if not line:
+                break
+            try:
+                self.responses.put(json.loads(line))
+            except Exception:
+                self.responses.put({"ok": False, "error": line.strip()})
+
+    def _start_locked(self):
+        if self.proc and self.proc.poll() is None:
+            return True
+        if not self.python_path.exists() or not self.worker_path.exists() or not SILERO_MODEL_PATH.exists():
+            return False
+        env = os.environ.copy()
+        env.setdefault("OMP_NUM_THREADS", "1")
+        env.setdefault("MKL_NUM_THREADS", "1")
+        env.setdefault("TORCH_NUM_THREADS", "1")
+        env.setdefault("SILERO_MODEL_PATH", str(SILERO_MODEL_PATH))
+        self.proc = subprocess.Popen(
+            [str(self.python_path), str(self.worker_path)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=None,
+            text=True,
+            bufsize=1,
+            env=env,
+        )
+        self.reader = threading.Thread(target=self._reader_loop, daemon=True)
+        self.reader.start()
+        try:
+            ready = self.responses.get(timeout=45)
+        except queue.Empty:
+            self.stop()
+            return False
+        if not ready.get("ok"):
+            print(f"[tts] silero worker not ready: {ready}", flush=True)
+            self.stop()
+            return False
+        print(f"[tts] silero worker ready: {ready.get('model')}", flush=True)
+        return True
+
+    def synthesize(self, text: str, speaker: str, wav: Path, timeout: float = 120.0) -> bool:
+        with self.lock:
+            if not self._start_locked():
+                return False
+            if not self.proc or not self.proc.stdin:
+                return False
+            req = {"text": text, "speaker": speaker, "audio_path": str(wav), "sample_rate": 48000}
+            try:
+                self.proc.stdin.write(json.dumps(req, ensure_ascii=False) + "\n")
+                self.proc.stdin.flush()
+                resp = self.responses.get(timeout=timeout)
+            except Exception as exc:
+                print(f"[tts] silero worker request failed: {exc}", flush=True)
+                self.stop()
+                return False
+            if not resp.get("ok"):
+                print(f"[tts] silero worker failed: {resp}", flush=True)
+                return False
+            return wav.exists()
+
+    def stop(self):
+        proc = self.proc
+        self.proc = None
+        if not proc:
+            return
+        try:
+            if proc.poll() is None and proc.stdin:
+                proc.stdin.write(json.dumps({"cmd": "stop"}) + "\n")
+                proc.stdin.flush()
+        except Exception:
+            pass
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+
+
 class Playback:
-    def __init__(self, output_device: str, voice: str):
+    def __init__(self, output_device: str, voice: str, tts_python: Path, tts_worker: Path):
         self.output_device = output_device
         self.voice = voice
         self.stop_event = threading.Event()
         self.lock = threading.Lock()
         self.processes: list[subprocess.Popen] = []
+        self.tts = SileroTTSClient(tts_python, tts_worker)
 
     def stop(self):
         self.stop_event.set()
@@ -204,92 +350,59 @@ class Playback:
             if p in self.processes:
                 self.processes.remove(p)
 
-    def speak_edge(self, text: str):
-        total_t0 = time.perf_counter()
-        edge = shutil.which("edge-tts")
+    def _play_wav(self, wav: Path):
+        p = self._track(subprocess.Popen(["aplay", "-D", self.output_device, "-q", str(wav)]))
+        try:
+            while p.poll() is None:
+                if self.stop_event.is_set():
+                    try:
+                        p.terminate()
+                    except Exception:
+                        pass
+                    break
+                time.sleep(0.03)
+        finally:
+            self._untrack(p)
+
+    def speak_silero(self, text: str, speaker: str = "aidar") -> bool:
         ffmpeg = shutil.which("ffmpeg")
         aplay = shutil.which("aplay")
-        if not (edge and ffmpeg and aplay):
-            print(f"[tts missing] {text}", flush=True)
-            return
+        if not (ffmpeg and aplay):
+            return False
         self.stop_event.clear()
-        chunks = split_sentences_ru(text)
-        if not chunks:
-            return
+        text = clean_text_for_tts(text)
+        if not text:
+            return False
+        total_t0 = time.perf_counter()
         with tempfile.TemporaryDirectory() as td:
-            ready = queue.Queue(maxsize=2)
-            sentinel = object()
+            wav = Path(td) / "silero.wav"
+            if not self.tts.synthesize(text=text, speaker=speaker, wav=wav):
+                print("[tts] silero synthesis failed", flush=True)
+                return False
+            playable = Path(td) / "silero_playable.wav"
+            r = subprocess.run(
+                [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", str(wav), "-ac", "2", str(playable)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=60,
+            )
+            if r.returncode != 0 or not playable.exists():
+                print("[tts] silero ffmpeg failed:", (r.stderr or r.stdout)[-500:], flush=True)
+                return False
+            print(f"[timing] tts.silero.total {time.perf_counter()-total_t0:.2f}s", flush=True)
+            self._play_wav(playable)
+            return True
 
-            def producer():
-                try:
-                    for i, chunk in enumerate(chunks, 1):
-                        if self.stop_event.is_set():
-                            break
-                        mp3 = Path(td) / f"tts_{i}.mp3"
-                        wav = Path(td) / f"tts_{i}.wav"
-                        chunk_t0 = time.perf_counter()
-                        print(f"[tts] prepare chunk {i}/{len(chunks)}: {chunk[:80]}", flush=True)
-                        r = subprocess.run(
-                            [edge, "--voice", self.voice, "--text", chunk, "--write-media", str(mp3)],
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE,
-                            text=True,
-                            timeout=45,
-                        )
-                        print(f"[timing] tts.edge chunk={i} {time.perf_counter()-chunk_t0:.2f}s", flush=True)
-                        if r.returncode != 0:
-                            print("[tts] edge failed:", (r.stderr or r.stdout)[-500:], flush=True)
-                            continue
-                        ff_t0 = time.perf_counter()
-                        r = subprocess.run(
-                            [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", str(mp3), str(wav)],
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE,
-                            text=True,
-                            timeout=20,
-                        )
-                        print(f"[timing] tts.ffmpeg chunk={i} {time.perf_counter()-ff_t0:.2f}s", flush=True)
-                        if r.returncode != 0:
-                            print("[tts] ffmpeg failed:", (r.stderr or r.stdout)[-500:], flush=True)
-                            continue
-                        while not self.stop_event.is_set():
-                            try:
-                                ready.put((i, wav), timeout=0.1)
-                                break
-                            except queue.Full:
-                                pass
-                finally:
-                    while True:
-                        try:
-                            ready.put(sentinel, timeout=0.1)
-                            break
-                        except queue.Full:
-                            if self.stop_event.is_set():
-                                break
-
-            threading.Thread(target=producer, daemon=True).start()
-            first_audio = True
-            while not self.stop_event.is_set():
-                item = ready.get()
-                if item is sentinel:
-                    break
-                i, wav = item
-                play_t0 = time.perf_counter()
-                if first_audio:
-                    print(f"[timing] tts.first_audio {time.perf_counter()-total_t0:.2f}s", flush=True)
-                    first_audio = False
-                p = self._track(subprocess.Popen([aplay, "-D", self.output_device, "-q", str(wav)]))
-                try:
-                    while p.poll() is None:
-                        if self.stop_event.is_set():
-                            try: p.terminate()
-                            except Exception: pass
-                            break
-                        time.sleep(0.03)
-                finally:
-                    print(f"[timing] tts.play chunk={i} {time.perf_counter()-play_t0:.2f}s", flush=True)
-                    self._untrack(p)
-        print(f"[timing] tts.total {time.perf_counter()-total_t0:.2f}s", flush=True)
+    def speak(self, text: str):
+        for chunk in split_sentences_ru(text):
+            if self.stop_event.is_set():
+                break
+            ok = self.speak_silero(chunk, speaker=self.voice or "aidar")
+            if not ok:
+                print(f"[tts] local silero unavailable, text only: {chunk}", flush=True)
+                break
+        return
 
 
 class VoiceLoop:
@@ -298,7 +411,7 @@ class VoiceLoop:
         self.audio_q = queue.Queue(maxsize=200)
         self.utterance_q = queue.Queue()
         self.stop = threading.Event()
-        self.playback = Playback(args.output_device, args.tts_voice)
+        self.playback = Playback(args.output_device, args.tts_voice, Path(args.tts_python), Path(args.tts_worker))
         self.vad = webrtcvad.Vad(args.vad)
         self.stt_lock = threading.Lock()
         self.model = None
@@ -323,25 +436,12 @@ class VoiceLoop:
                 print(f"[cue] failed: {e}", flush=True)
 
     def turn_cue(self, kind: str):
-        # diagnostic short beeps inside a dialogue turn:
-        # accepted = phrase taken for processing; resume = mic is live again.
         freq = self.args.accepted_cue_hz if kind == "accepted" else self.args.resume_cue_hz
         with self.cue_lock:
             try:
                 play_tone(self.args.output_device, freq=freq, duration_ms=self.args.turn_cue_ms, volume=self.args.turn_cue_volume)
             except Exception as e:
                 print(f"[turn-cue] failed: {e}", flush=True)
-
-    def set_listening_muted(self, muted: bool, reason: str = ""):
-        if self.listening_muted == muted:
-            return
-        self.listening_muted = muted
-        if muted:
-            print(f"[mic] stop listening {reason}".strip(), flush=True)
-            self.cue("stop")
-        else:
-            print("[mic] start listening", flush=True)
-            self.cue("start")
 
     def load_model(self):
         if self.model is None:
@@ -351,7 +451,7 @@ class VoiceLoop:
     def audio_callback(self, indata, frames, time_info, status):
         if status and self.args.debug_audio_status:
             print(f"[audio status] {status}", flush=True)
-        if self.listening_muted or CONTROL_MUTE_FILE.exists():
+        if self.listening_muted or control_flag(MIC_MUTE_FILE):
             return
         if self.stt_lock.locked() and self.args.drop_mic_during_stt:
             return
@@ -365,9 +465,6 @@ class VoiceLoop:
             else:
                 mono = resample_poly(mono, VAD_RATE, hw_rate)
         pcm = np.clip(mono * 32768, -32768, 32767).astype(np.int16).tobytes()
-        # WebRTC VAD accepts only exact 10/20/30 ms frames. Some hardware/resampler
-        # combinations can produce +/- samples, so normalize here instead of letting
-        # vad_worker explode mid-dialogue.
         pcm = self._pcm_tail + pcm
         frames_out = []
         while len(pcm) >= FRAME_BYTES:
@@ -378,7 +475,6 @@ class VoiceLoop:
             for frame in frames_out:
                 self.audio_q.put_nowait(frame)
         except queue.Full:
-            # Drop backlog rather than increasing live dialogue latency.
             while True:
                 try:
                     self.audio_q.get_nowait()
@@ -403,18 +499,6 @@ class VoiceLoop:
 
         print("[vad] listening... говори свободно, я сам пойму паузу.", flush=True)
         while not self.stop.is_set():
-            if CONTROL_RESET_FILE.exists():
-                CONTROL_RESET_FILE.unlink(missing_ok=True)
-                while True:
-                    try:
-                        self.audio_q.get_nowait()
-                    except Exception:
-                        break
-                pre.clear(); candidate.clear(); speech = []
-                triggered = False
-                speech_count = silence_count = consecutive_start = 0
-                print("[vad] reset by control", flush=True)
-                continue
             try:
                 frame = self.audio_q.get(timeout=0.5)
             except queue.Empty:
@@ -450,6 +534,7 @@ class VoiceLoop:
                     pre.clear(); candidate.clear()
                     speech_count = consecutive_start
                     silence_count = 0
+                    write_state("recording")
                     print("[vad] speech started", flush=True)
                 continue
 
@@ -467,6 +552,7 @@ class VoiceLoop:
                 dur = len(speech) * FRAME_MS / 1000.0
                 rms, mx = db_from_pcm16(pcm)
                 if speech_count >= min_speech_frames:
+                    write_state("thinking", utterance_sec=round(dur, 2), rms_db=rms, max_db=mx)
                     print(f"[vad] speech ended dur={dur:.1f}s rms={rms}dB max={mx}dB", flush=True)
                     self.utterance_q.put(pcm)
                 else:
@@ -496,6 +582,9 @@ class VoiceLoop:
             text = " ".join(s.text.strip() for s in segments).strip()
             print(f"[stt] lang={info.language} prob={info.language_probability:.3f} text={text or '[NO_SPEECH]'}", flush=True)
             print(f"[timing] stt {time.perf_counter()-t0:.2f}s", flush=True)
+            if is_whisper_hallucination(text):
+                print(f"[stt] dropped hallucination: {text!r}", flush=True)
+                text = ""
             if self.args.save_utterances:
                 out = Path(self.args.save_utterances)
                 out.mkdir(parents=True, exist_ok=True)
@@ -505,7 +594,7 @@ class VoiceLoop:
 
     def _voice_messages(self, text: str):
         return [
-            {"role": "system", "content": "Отвечай по-русски устно: 1 короткое предложение, максимум 20 слов, без Markdown, списков, эмодзи и ссылок."},
+            {"role": "system", "content": "Отвечай по-русски естественно и по существу. Дай 1–2 коротких предложения, без Markdown, списков, эмодзи и ссылок. Не молчи и не возвращай пустой ответ."},
             {"role": "user", "content": text},
         ]
 
@@ -550,17 +639,72 @@ class VoiceLoop:
         data = r.json()
         return (data.get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
 
+    def load_voice_session_id(self):
+        try:
+            if VOICE_SESSION_ID_FILE.exists():
+                sid = VOICE_SESSION_ID_FILE.read_text(encoding="utf-8").strip()
+                return sid or ""
+        except Exception:
+            return ""
+        return ""
+
+    def save_voice_session_id(self, sid: str):
+        try:
+            if sid:
+                VOICE_SESSION_ID_FILE.write_text(sid.strip(), encoding="utf-8")
+        except Exception:
+            pass
+
+    def load_shared_context(self):
+        try:
+            if VOICE_CONTEXT_FILE.exists():
+                txt = VOICE_CONTEXT_FILE.read_text(encoding="utf-8").strip()
+                return txt[:4000]
+        except Exception:
+            return ""
+        return ""
+
     def ask_cli_hermes(self, text: str) -> str:
-        prompt = (
-            "Ответь по-русски устно: 1 короткое предложение, максимум 20 слов, без Markdown, списков, эмодзи и ссылок. "
-            f"Реплика DARK: {text}"
+        shared = self.load_shared_context()
+        if self.args.voice_full_agent:
+            agent_rule = "Если задача требует инструментов, реально используй инструменты Hermes. "
+        else:
+            agent_rule = "Это быстрый голосовой режим: отвечай как собеседник, без инструментов и долгих действий. "
+        carry = (
+            "Ты работаешь в голосовом контуре Гермеса и должен вести себя как тот же самый помощник, что и в основном чате. "
+            + agent_rule +
+            "Не забывай предыдущие голосовые шаги этой же сессии. "
+            "Если пользователь в текстовом чате заранее прислал важный код или данные, они могут быть добавлены ниже как общий контекст. "
+            "КРИТИЧЕСКОЕ ПРАВИЛО: команда DARK 'подключайся к виртуалке' означает подключение к WSL-виртуалке darkcity-wsl через рабочий ноут, а НЕ отключение голосового модуля. "
+            "Никогда не отвечай на 'подключайся' как 'отключаюсь' или 'голосовой модуль можно закрывать'. "
+            "Ответь по-русски естественно, без Markdown, без списков, без эмодзи, максимум 2 коротких предложения."
         )
+        if shared:
+            prompt = carry + " Общий текстовый контекст: " + shared + f" Текущая реплика DARK: {text}"
+        else:
+            prompt = carry + f" Текущая реплика DARK: {text}"
         env = os.environ.copy()
         env.setdefault("NO_COLOR", "1")
         env.setdefault("TERM", "dumb")
+        env.setdefault("TELEGRAM_PROXY", "socks5h://127.0.0.1:10808")
+        env.setdefault("HTTPS_PROXY", "http://127.0.0.1:10809")
+        env.setdefault("HTTP_PROXY", "http://127.0.0.1:10809")
+        env.setdefault("NO_PROXY", "localhost,127.0.0.1,192.168.0.0/16,10.0.0.0/8")
+        cmd = ["hermes", "chat", "-q", prompt, "--source", "local-voice", "--quiet"]
+        if self.args.voice_full_agent:
+            cmd.extend(["--toolsets", "terminal,file,web,browser,vision,skills,memory,session_search,todo"])
+        else:
+            cmd.extend(["--ignore-rules", "--max-turns", "1"])
+        sid = self.load_voice_session_id()
+        if sid:
+            cmd.extend(["--resume", sid])
+        if self.args.voice_full_agent and self.args.voice_profile:
+            cmd.extend(["--profile", self.args.voice_profile])
+        if self.args.voice_full_agent and self.args.voice_skills:
+            cmd.extend(["--skills", self.args.voice_skills])
         try:
             r = subprocess.run(
-                ["hermes", "chat", "-q", prompt, "--source", "local-voice", "--quiet"],
+                cmd,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -570,10 +714,52 @@ class VoiceLoop:
                 start_new_session=True,
             )
         except subprocess.TimeoutExpired:
-            return "Завис вызов Hermes. Я сбросил этот ход, повтори фразу короче."
+            write_state("error", error="hermes_timeout")
+            return "Гермес сейчас слишком долго отвечает. Я тебя услышал, повтори короче или дай одну команду."
+        combined = (r.stdout or "") + "\n" + (r.stderr or "")
+        m = re.search(r"session_id:\s*([A-Za-z0-9_\-]+)", combined)
+        if m:
+            self.save_voice_session_id(m.group(1))
         if r.returncode != 0:
-            return "Ошибка Hermes: " + (r.stderr or r.stdout)[-700:]
-        return r.stdout.strip()
+            print("[llm] hermes cli failed:", (r.stderr or r.stdout)[-2000:], flush=True)
+            write_state("error", error="hermes_cli_failed")
+            return "Гермес сейчас не ответил по сети. Голосовой контур живой, попробуй ещё раз через пару секунд."
+        cleaned = []
+        for line in (r.stdout or "").splitlines():
+            t = line.strip()
+            if not t:
+                continue
+            if t.startswith("session_id:"):
+                continue
+            if t.startswith("session id:"):
+                continue
+            if t.startswith("↻ Resumed session"):
+                continue
+            if t.startswith("MEDIA:"):
+                continue
+            if t.startswith("Commentary to="):
+                continue
+            if t.startswith("Traceback ") or t.startswith("File \""):
+                continue
+            if t.startswith("Tool ") or t.startswith("functions.") or t.startswith("image_gen"):
+                continue
+            if re.match(r"^[A-Za-z](?:\s+[A-Za-z]){3,}$", t):
+                continue
+            if re.match(r"^(?:[A-Za-zА-Яа-я0-9]+\s+){4,}[A-Za-zА-Яа-я0-9]+$", t) and len(t) < 80 and not re.search(r"[.!?]", t):
+                continue
+            cleaned.append(line)
+        text_out = "\n".join(cleaned).strip()
+        candidates = [blk.strip() for blk in re.split(r"\n{2,}", text_out) if blk.strip()]
+        if candidates:
+            text_out = candidates[-1]
+        sentence_lines = []
+        for line in text_out.splitlines():
+            t = line.strip()
+            if re.search(r"[.!?…]", t):
+                sentence_lines.append(t)
+        if sentence_lines:
+            text_out = " ".join(sentence_lines)
+        return text_out
 
     def ask_hermes(self, text: str) -> str:
         print(f"[llm] thinking backend={self.args.llm_backend}...", flush=True)
@@ -599,12 +785,14 @@ class VoiceLoop:
         while not self.stop.is_set():
             pcm = self.utterance_q.get()
             self.listening_muted = True
+            write_state("thinking")
             print("[mic] accepted phrase, processing", flush=True)
             if self.args.turn_cues:
                 self.turn_cue("accepted")
             text = self.transcribe(pcm)
             if not text:
                 self.listening_muted = False
+                write_state("listening")
                 print("[mic] listening resumed", flush=True)
                 if self.args.turn_cues:
                     self.turn_cue("resume")
@@ -612,20 +800,23 @@ class VoiceLoop:
             print(f"\n[DARK] {text}\n", flush=True)
             reply = self.ask_hermes(text)
             print(f"\n[Максим] {reply}\n", flush=True)
-            if self.args.no_tts:
+            if self.args.no_tts or control_flag(SPEAKER_MUTE_FILE):
                 self.listening_muted = False
+                write_state("listening", last_text=text, last_reply=reply, tts_skipped=True)
                 print("[mic] listening resumed", flush=True)
                 if self.args.turn_cues:
                     self.turn_cue("resume")
                 continue
             self.assistant_speaking = True
+            write_state("speaking", last_text=text, last_reply=reply)
             try:
-                self.playback.speak_edge(reply)
+                self.playback.speak(reply)
             finally:
                 self.assistant_speaking = False
                 if self.args.after_tts_pause_ms > 0:
                     time.sleep(self.args.after_tts_pause_ms / 1000.0)
                 self.listening_muted = False
+                write_state("listening", last_text=text, last_reply=reply)
                 print("[mic] listening resumed", flush=True)
                 if self.args.turn_cues:
                     self.turn_cue("resume")
@@ -633,6 +824,8 @@ class VoiceLoop:
     def run(self):
         if self.args.preload_stt:
             self.load_model()
+        CONTROL_DIR.mkdir(parents=True, exist_ok=True)
+        write_state("starting")
         threading.Thread(target=self.vad_worker, daemon=True).start()
         threading.Thread(target=self.assistant_worker, daemon=True).start()
         print(f"[audio] input_device={self.args.input_device!r} output_device={self.args.output_device!r} samplerate={self.args.samplerate}", flush=True)
@@ -645,6 +838,7 @@ class VoiceLoop:
             callback=self.audio_callback,
         ):
             print("[ready] Voice loop is running. Ctrl+C to stop.", flush=True)
+            write_state("listening")
             self.cue("start")
             while not self.stop.is_set():
                 time.sleep(0.2)
@@ -676,20 +870,28 @@ def main():
     ap.add_argument("--end-silence-ms", type=int, default=2350)
     ap.add_argument("--min-speech-ms", type=int, default=350)
     ap.add_argument("--max-utterance-ms", type=int, default=30000)
-    ap.add_argument("--tts-voice", default="ru-RU-DmitryNeural")
+    ap.add_argument("--tts-voice", default="aidar")
+    ap.add_argument("--tts-python", default=str(DEFAULT_TTS_PYTHON))
+    ap.add_argument("--tts-worker", default=str(DEFAULT_TTS_WORKER))
     ap.add_argument("--samplerate", type=int, default=None, help="hardware input sample rate; default=device default or 16000")
     ap.add_argument("--no-tts", action="store_true")
     ap.add_argument("--barge-in", action="store_true", default=False)
     ap.add_argument("--no-barge-in", dest="barge_in", action="store_false")
     ap.add_argument("--level-interval", type=float, default=2.5)
     ap.add_argument("--save-utterances", default="/tmp/hermes_voice_utterances")
-    ap.add_argument("--hermes-timeout", type=int, default=20)
-    ap.add_argument("--llm-backend", choices=["direct", "cli"], default="direct", help="direct provider API avoids spawning hermes CLI each turn")
-    ap.add_argument("--llm-fallback-cli", action="store_true", help="fallback to slow hermes CLI if direct provider fails")
+    ap.add_argument("--hermes-timeout", type=int, default=90)
+    ap.add_argument("--llm-backend", choices=["direct", "cli"], default="cli", help="cli restores the old Hermes-aware multi-turn/tool-enabled contour; direct is fallback only")
+    ap.add_argument("--llm-fallback-cli", action="store_true", help="fallback to hermes CLI if direct provider fails")
     ap.add_argument("--llm-connect-timeout", type=float, default=8.0)
     ap.add_argument("--llm-temperature", type=float, default=0.4)
-    ap.add_argument("--llm-max-tokens", type=int, default=64)
+    ap.add_argument("--llm-max-tokens", type=int, default=160)
     ap.add_argument("--hermes-config", default=str(HERMES_CONFIG))
+    ap.add_argument("--voice-profile", default="", help="Hermes profile for full tool-enabled voice agent")
+    ap.add_argument("--voice-skills", default="", help="Comma-separated Hermes skills to preload in voice mode")
+    ap.add_argument("--voice-full-agent", action="store_true", help="use full Hermes rules/toolsets instead of fast low-latency voice mode")
+    ap.add_argument("--append-context", default="", help="Append shared text context from chat into voice context file and exit")
+    ap.add_argument("--show-voice-session", action="store_true", help="Print stored voice session id and exit")
+    ap.add_argument("--ask-test", default="", help="Ask Hermes once through the voice adapter, speak the reply, and exit")
     ap.add_argument("--say-test", action="store_true", help="synthesize and play a short Russian phrase, then exit")
     ap.add_argument("--preload-stt", action="store_true", help="load Whisper before opening the mic; default loads on first utterance")
     ap.add_argument("--drop-mic-during-stt", action="store_true", default=True, help="avoid input backlog/overflow while CPU is transcribing")
@@ -715,11 +917,28 @@ def main():
     if args.list_devices:
         list_devices()
         return
+    if args.show_voice_session:
+        try:
+            print(VOICE_SESSION_ID_FILE.read_text(encoding="utf-8").strip())
+        except Exception:
+            print("")
+        return
+    if args.append_context:
+        existing = ""
+        try:
+            if VOICE_CONTEXT_FILE.exists():
+                existing = VOICE_CONTEXT_FILE.read_text(encoding="utf-8")
+        except Exception:
+            existing = ""
+        merged = (existing + "\n" + args.append_context).strip()[-12000:]
+        VOICE_CONTEXT_FILE.write_text(merged, encoding="utf-8")
+        print("VOICE_CONTEXT_UPDATED")
+        return
     if args.input_device is None:
         preferred = find_shem_boy_input()
         if preferred is not None:
             args.input_device = preferred
-            print(f"[audio] auto-selected SHEM-BOY input device {preferred}", flush=True)
+            print(f"[audio] auto-selected USB input device {preferred}", flush=True)
     if args.samplerate is None:
         try:
             info = sd.query_devices(args.input_device, 'input')
@@ -727,8 +946,19 @@ def main():
         except Exception:
             args.samplerate = VAD_RATE
     if args.say_test:
-        play_audio_file(args.start_sound, args.output_device)
-        Playback(args.output_device, args.tts_voice).speak_edge("Проверка голосового контура. Максим на связи.")
+        if args.start_sound:
+            try:
+                play_audio_file(args.start_sound, args.output_device)
+            except Exception as e:
+                print(f"[cue] say-test start sound skipped: {e}", flush=True)
+        Playback(args.output_device, args.tts_voice, Path(args.tts_python), Path(args.tts_worker)).speak("Проверка голосового контура. Максим на связи.")
+        return
+    if args.ask_test:
+        loop = VoiceLoop(args)
+        reply = loop.ask_hermes(args.ask_test)
+        print(reply, flush=True)
+        if not args.no_tts:
+            loop.playback.speak(reply)
         return
     loop = VoiceLoop(args)
     try:
@@ -738,6 +968,7 @@ def main():
         loop.stop.set()
         loop.playback.stop()
         loop.cue("stop")
+        write_state("stopped")
 
 if __name__ == "__main__":
     main()
